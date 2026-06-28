@@ -201,6 +201,7 @@ export function AudioProvider({ children }) {
     setSpeakerPreset,
     transport,
     setTransport,
+    playbackControlsRef,
     OUTPUT_CHANNELS,
     SPEAKER_POSITIONS,
   }

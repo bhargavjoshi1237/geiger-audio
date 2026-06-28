@@ -1,88 +1,131 @@
 'use client'
 
-import { useRef, useEffect, useCallback } from 'react'
-import { Play, Square, SkipBack, Circle, Volume2, Headphones, Speaker, Upload } from 'lucide-react'
+import { useRef, useEffect, useCallback, useState } from 'react'
+import { Play, Square, SkipBack, Circle, Volume2, Headphones, Speaker, Upload, Pause, Download, Loader } from 'lucide-react'
 import { useAudio } from '@/context/AudioContext'
 import { loadAudioFile } from '@/lib/audio/fileLoader'
 import { startObjectPlayback, stopObjectPlayback } from '@/lib/audio/spatialEngine'
+import { renderToWav, downloadWav } from '@/lib/audio/exporter'
 
 export default function TransportBar() {
-  const { transport, setTransport, objects, addObject, setSourceNode, getAudioCtx } = useAudio()
+  const { transport, setTransport, objects, addObject, setSourceNode, getAudioCtx, playbackControlsRef } = useAudio()
+  const [exportState, setExportState] = useState(null) // null | 'rendering' | 'done'
+  const [exportProgress, setExportProgress] = useState(0)
   const timecodeRef = useRef(null)
-  const frameRef = useRef(null)
-  const startTimeRef = useRef(null)
+  const rafRef = useRef(null)
   const sourceNodesRef = useRef({})
   const fileInputRef = useRef(null)
+  const playbackOffsetRef = useRef(0)   // saved seconds when paused or seeked
+  const playStartWallRef = useRef(null) // performance.now() when current play started
+  const objectsRef = useRef(objects)
+  useEffect(() => { objectsRef.current = objects }, [objects])
 
-  // Timecode update loop
-  useEffect(() => {
-    if (transport.isPlaying) {
-      if (startTimeRef.current === null) startTimeRef.current = performance.now()
-      const base = startTimeRef.current
+  const formatTC = useCallback((pos) => {
+    const h = Math.floor(pos / 3600)
+    const m = Math.floor((pos % 3600) / 60)
+    const s = Math.floor(pos % 60)
+    const f = Math.floor((pos % 1) * 30)
+    return [h, m, s, f].map(n => String(n).padStart(2, '0')).join(':')
+  }, [])
 
-      function tick() {
-        const elapsed = (performance.now() - base) / 1000
-        const h = Math.floor(elapsed / 3600)
-        const m = Math.floor((elapsed % 3600) / 60)
-        const s = Math.floor(elapsed % 60)
-        const f = Math.floor((elapsed % 1) * 30)
-        const tc = [h, m, s, f].map(n => String(n).padStart(2, '0')).join(':')
-        if (timecodeRef.current) timecodeRef.current.textContent = tc
-        frameRef.current = requestAnimationFrame(tick)
-      }
-      frameRef.current = requestAnimationFrame(tick)
-    } else {
-      cancelAnimationFrame(frameRef.current)
+  const getPosition = useCallback(() => {
+    if (playStartWallRef.current !== null) {
+      return playbackOffsetRef.current + (performance.now() - playStartWallRef.current) / 1000
     }
-    return () => cancelAnimationFrame(frameRef.current)
-  }, [transport.isPlaying])
+    return playbackOffsetRef.current
+  }, [])
 
-  const handlePlay = useCallback(() => {
-    const ctx = getAudioCtx()
-    if (ctx.state === 'suspended') ctx.resume()
+  const getDuration = useCallback(() => {
+    const obs = objectsRef.current
+    if (!obs.length) return 0
+    return Math.max(...obs.map(o => o.buffer?.duration ?? 0))
+  }, [])
 
-    if (transport.isPlaying) {
-      Object.values(sourceNodesRef.current).forEach(stopObjectPlayback)
-      sourceNodesRef.current = {}
-      setTransport(t => ({ ...t, isPlaying: false }))
-    } else {
-      objects.forEach(obj => {
-        if (obj.buffer && !obj.muted) {
-          const node = startObjectPlayback(ctx, obj)
-          if (node) {
-            sourceNodesRef.current[obj.id] = node
-            setSourceNode(obj.id, node)
-          }
-        }
-      })
-      if (startTimeRef.current === null) startTimeRef.current = performance.now()
-      setTransport(t => ({ ...t, isPlaying: true }))
-    }
-  }, [transport.isPlaying, objects, getAudioCtx, setTransport, setSourceNode])
-
-  const handleRewind = useCallback(() => {
+  const stopAllSources = useCallback(() => {
     Object.values(sourceNodesRef.current).forEach(stopObjectPlayback)
     sourceNodesRef.current = {}
-    startTimeRef.current = null
+  }, [])
+
+  const startSourcesAt = useCallback((offset) => {
+    const ctx = getAudioCtx()
+    if (ctx.state === 'suspended') ctx.resume()
+    objectsRef.current.forEach(obj => {
+      if (obj.buffer && !obj.muted) {
+        const node = startObjectPlayback(ctx, obj, offset)
+        if (node) {
+          sourceNodesRef.current[obj.id] = node
+          setSourceNode(obj.id, node)
+        }
+      }
+    })
+  }, [getAudioCtx, setSourceNode])
+
+  const seekTo = useCallback((seconds) => {
+    const pos = Math.max(0, seconds)
+    const wasPlaying = playStartWallRef.current !== null
+    stopAllSources()
+    playbackOffsetRef.current = pos
+    playStartWallRef.current = null
+    if (timecodeRef.current) timecodeRef.current.textContent = formatTC(pos)
+    if (wasPlaying) {
+      startSourcesAt(pos)
+      playStartWallRef.current = performance.now() - pos * 1000
+    }
+  }, [stopAllSources, startSourcesAt, formatTC])
+
+  // Expose controls to SeekBar
+  useEffect(() => {
+    if (playbackControlsRef) {
+      playbackControlsRef.current = { getPosition, seekTo, getDuration }
+    }
+  }, [playbackControlsRef, getPosition, seekTo, getDuration])
+
+  // Timecode RAF loop
+  useEffect(() => {
+    if (transport.isPlaying) {
+      const tick = () => {
+        if (timecodeRef.current) timecodeRef.current.textContent = formatTC(getPosition())
+        rafRef.current = requestAnimationFrame(tick)
+      }
+      rafRef.current = requestAnimationFrame(tick)
+    } else {
+      cancelAnimationFrame(rafRef.current)
+    }
+    return () => cancelAnimationFrame(rafRef.current)
+  }, [transport.isPlaying, getPosition, formatTC])
+
+  const handlePlay = useCallback(() => {
+    if (transport.isPlaying) return
+    startSourcesAt(playbackOffsetRef.current)
+    playStartWallRef.current = performance.now() - playbackOffsetRef.current * 1000
+    setTransport(t => ({ ...t, isPlaying: true, isPaused: false }))
+  }, [transport.isPlaying, startSourcesAt, setTransport])
+
+  const handlePause = useCallback(() => {
+    if (!transport.isPlaying) return
+    playbackOffsetRef.current = getPosition()
+    playStartWallRef.current = null
+    stopAllSources()
+    if (timecodeRef.current) timecodeRef.current.textContent = formatTC(playbackOffsetRef.current)
+    setTransport(t => ({ ...t, isPlaying: false, isPaused: true }))
+  }, [transport.isPlaying, getPosition, stopAllSources, formatTC, setTransport])
+
+  const handleStop = useCallback(() => {
+    stopAllSources()
+    playbackOffsetRef.current = 0
+    playStartWallRef.current = null
     if (timecodeRef.current) timecodeRef.current.textContent = '00:00:00:00'
-    setTransport(t => ({ ...t, isPlaying: false }))
-  }, [setTransport])
+    setTransport(t => ({ ...t, isPlaying: false, isPaused: false }))
+  }, [stopAllSources, setTransport])
 
   const handleMasterGain = useCallback((e) => {
-    const val = parseFloat(e.target.value)
-    setTransport(t => ({ ...t, masterGain: val }))
-    // Apply to Web Audio master gain node directly
-    try {
-      const ctx = getAudioCtx()
-      // masterGainRef is accessible via getAudioCtx side effect
-    } catch (_) {}
-  }, [setTransport, getAudioCtx])
+    setTransport(t => ({ ...t, masterGain: parseFloat(e.target.value) }))
+  }, [setTransport])
 
   const handleFiles = useCallback(async (files) => {
     let ctx
     try { ctx = getAudioCtx() } catch (_) { return }
     if (ctx.state === 'suspended') ctx.resume()
-
     for (const file of Array.from(files)) {
       if (!file.type.startsWith('audio/')) continue
       try {
@@ -103,22 +146,40 @@ export default function TransportBar() {
     }
   }, [getAudioCtx, addObject])
 
-  const onFilePick = (e) => {
-    handleFiles(e.target.files)
-    e.target.value = ''
-  }
+  const handleExport = useCallback(async () => {
+    if (exportState === 'rendering') return
+    const ctx = getAudioCtx()
+    setExportState('rendering')
+    setExportProgress(0)
+    try {
+      const wav = await renderToWav(
+        objectsRef.current,
+        transport.masterGain,
+        ctx.sampleRate,
+        (p) => setExportProgress(Math.round(p * 100)),
+      )
+      const name = (transport.sessionName || 'render').replace(/[^a-z0-9_-]/gi, '_')
+      downloadWav(wav, `${name}.wav`)
+      setExportState('done')
+      setTimeout(() => setExportState(null), 2500)
+    } catch (err) {
+      console.error('Export failed:', err)
+      setExportState(null)
+    }
+  }, [exportState, getAudioCtx, transport.masterGain, transport.sessionName])
 
+  const onFilePick = (e) => { handleFiles(e.target.files); e.target.value = '' }
   const onDrop = (e) => { e.preventDefault(); handleFiles(e.dataTransfer.files) }
   const onDragOver = (e) => e.preventDefault()
 
-  const btnBase = 'w-9 h-9 flex items-center justify-center rounded border border-[#333333] bg-[#242424] hover:bg-[#2a2a2a] text-[#a3a3a3] hover:text-white transition-all cursor-pointer'
-  const btnOrange = 'border-[#FF6B00] text-[#FF6B00] bg-[#FF6B00]/10'
+  const btn = 'w-9 h-9 flex items-center justify-center rounded border border-[#333333] bg-[#242424] hover:bg-[#2a2a2a] text-[#a3a3a3] hover:text-white transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed'
+  const btnActive = 'border-[#FF6B00] text-[#FF6B00] bg-[#FF6B00]/10'
 
   return (
     <div
       onDrop={onDrop}
       onDragOver={onDragOver}
-      className="fixed bottom-0 left-0 right-0 h-14 bg-[#0A0A0A] border-t border-[#333333] flex items-center px-4 gap-4 z-50 select-none"
+      className="h-14 bg-[#0A0A0A] border-t border-[#333333] flex items-center px-4 gap-4 select-none shrink-0"
     >
       {/* Left: import + session name */}
       <div className="flex items-center gap-3 flex-1 min-w-0">
@@ -129,14 +190,7 @@ export default function TransportBar() {
           <Upload size={11} />
           Import Audio
         </button>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="audio/*"
-          multiple
-          className="hidden"
-          onChange={onFilePick}
-        />
+        <input ref={fileInputRef} type="file" accept="audio/*" multiple className="hidden" onChange={onFilePick} />
         <input
           type="text"
           value={transport.sessionName}
@@ -149,29 +203,43 @@ export default function TransportBar() {
         )}
       </div>
 
-      {/* Centre: transport + timecode */}
-      <div className="flex items-center gap-2 shrink-0">
-        <button onClick={handleRewind} className={btnBase} title="Rewind to start">
+      {/* Centre: transport controls + timecode */}
+      <div className="flex items-center gap-1.5 shrink-0">
+        <button onClick={handleStop} className={btn} title="Rewind to start">
           <SkipBack size={13} />
         </button>
         <button
           onClick={handlePlay}
-          className={`${btnBase} w-10 h-10 ${transport.isPlaying ? btnOrange : ''}`}
-          title={transport.isPlaying ? 'Stop' : objects.length === 0 ? 'Import audio first' : 'Play'}
+          disabled={transport.isPlaying}
+          className={`${btn} w-10 h-10`}
+          title="Play"
         >
-          {transport.isPlaying
-            ? <Square size={13} fill="currentColor" />
-            : <Play size={13} fill="currentColor" />}
+          <Play size={13} fill="currentColor" />
+        </button>
+        <button
+          onClick={handlePause}
+          disabled={!transport.isPlaying}
+          className={`${btn} ${transport.isPaused ? btnActive : ''}`}
+          title="Pause"
+        >
+          <Pause size={13} />
+        </button>
+        <button
+          onClick={handleStop}
+          className={btn}
+          title="Stop"
+        >
+          <Square size={13} fill="currentColor" />
         </button>
         <button
           onClick={() => setTransport(t => ({ ...t, isRecording: !t.isRecording }))}
-          className={`${btnBase} ${transport.isRecording ? 'border-red-500 text-red-500 bg-red-500/10' : ''}`}
+          className={`${btn} ${transport.isRecording ? 'border-red-500 text-red-500 bg-red-500/10' : ''}`}
           title="Record"
         >
           <Circle size={13} fill={transport.isRecording ? 'currentColor' : 'none'} />
         </button>
 
-        <div className="ml-3 px-3 py-1.5 bg-[#060606] border border-[#2a2a2a] rounded">
+        <div className="ml-2 px-3 py-1.5 bg-[#060606] border border-[#2a2a2a] rounded">
           <span
             ref={timecodeRef}
             className="font-mono text-sm tracking-widest tabular-nums"
@@ -186,10 +254,7 @@ export default function TransportBar() {
       <div className="flex items-center gap-3 flex-1 justify-end">
         <Volume2 size={12} className="text-[#737373] shrink-0" />
         <input
-          type="range"
-          min="0"
-          max="1"
-          step="0.01"
+          type="range" min="0" max="1" step="0.01"
           value={transport.masterGain}
           onChange={handleMasterGain}
           className="w-20 shrink-0"
@@ -203,7 +268,7 @@ export default function TransportBar() {
             ...t,
             outputMode: t.outputMode === 'headphones' ? 'speakers' : 'headphones',
           }))}
-          className={btnBase}
+          className={btn}
           title={`Output: ${transport.outputMode}`}
         >
           {transport.outputMode === 'headphones' ? <Headphones size={13} /> : <Speaker size={13} />}
@@ -211,6 +276,30 @@ export default function TransportBar() {
         <span className="text-xs text-[#4a4a4a] font-mono shrink-0">
           {transport.latency === 0 ? '—' : `${(transport.latency * 1000).toFixed(0)}ms`}
         </span>
+
+        {/* Divider */}
+        <div className="w-px h-6 bg-[#2a2a2a] shrink-0" />
+
+        {/* Export WAV */}
+        <button
+          onClick={handleExport}
+          disabled={objects.length === 0 || exportState === 'rendering'}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium border transition-all shrink-0
+            ${exportState === 'done'
+              ? 'border-green-600 bg-green-600/10 text-green-500'
+              : exportState === 'rendering'
+                ? 'border-[#FF6B00] bg-[#FF6B00]/10 text-[#FF6B00] cursor-wait'
+                : 'border-[#333333] bg-[#202020] text-[#a3a3a3] hover:border-[#474747] hover:text-white disabled:opacity-30 disabled:cursor-not-allowed'
+            }`}
+          title="Render spatial mix to WAV"
+        >
+          {exportState === 'rendering'
+            ? <><Loader size={11} className="animate-spin" /> {exportProgress}%</>
+            : exportState === 'done'
+              ? <><Download size={11} /> Done</>
+              : <><Download size={11} /> Export WAV</>
+          }
+        </button>
       </div>
     </div>
   )

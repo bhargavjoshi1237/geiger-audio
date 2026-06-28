@@ -1,11 +1,13 @@
 'use client'
 
-import { useRef, Suspense, useCallback, useState } from 'react'
+import { useRef, Suspense, useCallback, useState, useEffect } from 'react'
 import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { OrbitControls, Grid, Html } from '@react-three/drei'
 import * as THREE from 'three'
+import { Lock, LockOpen, ZoomIn, ZoomOut, Magnet } from 'lucide-react'
 import { useAudio } from '@/context/AudioContext'
 import RoomMinimap from './RoomMinimap'
+import OrthoView from './OrthoView'
 
 function RoomWireframe() {
   return (
@@ -42,47 +44,56 @@ function SpeakerMesh({ speaker }) {
   )
 }
 
-const DRAG_PLANE = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0)
+const DRAG_PLANE   = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0)
 const _intersection = new THREE.Vector3()
 
-function AudioObjectSphere({ obj, isSelected, onSelect, onDrag }) {
-  const meshRef = useRef()
+function AudioObjectSphere({ obj, isSelected, onSelect, onDrag, orbitRef, lockedRef }) {
+  const meshRef  = useRef()
   const dragging = useRef(false)
   const { gl, raycaster } = useThree()
+
+  // Re-enable orbit on pointer up anywhere (handles releasing outside mesh)
+  useEffect(() => {
+    const onUp = () => {
+      if (!dragging.current) return
+      dragging.current = false
+      if (orbitRef?.current && !lockedRef?.current) orbitRef.current.enabled = true
+      gl.domElement.style.cursor = 'auto'
+    }
+    window.addEventListener('pointerup', onUp)
+    return () => window.removeEventListener('pointerup', onUp)
+  }, [gl, orbitRef, lockedRef])
 
   const handlePointerDown = useCallback((e) => {
     e.stopPropagation()
     dragging.current = true
+    // Disable orbit so it doesn't fight the drag
+    if (orbitRef?.current) orbitRef.current.enabled = false
     gl.domElement.style.cursor = 'grabbing'
     onSelect(obj.id)
-  }, [gl, obj.id, onSelect])
+  }, [gl, obj.id, onSelect, orbitRef])
 
   const handlePointerUp = useCallback((e) => {
     e.stopPropagation()
     dragging.current = false
+    if (orbitRef?.current && !lockedRef?.current) orbitRef.current.enabled = true
     gl.domElement.style.cursor = 'grab'
-  }, [gl])
+  }, [gl, orbitRef, lockedRef])
 
   const handlePointerMove = useCallback((e) => {
     if (!dragging.current) return
     e.stopPropagation()
     if (raycaster.ray.intersectPlane(DRAG_PLANE, _intersection)) {
-      onDrag(
-        obj.id,
-        Math.max(-4.5, Math.min(4.5, _intersection.x)),
-        obj.y,
-        Math.max(-4.5, Math.min(4.5, _intersection.z)),
-      )
+      const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v))
+      onDrag(obj.id, clamp(_intersection.x, -4.5, 4.5), obj.y, clamp(_intersection.z, -4.5, 4.5))
     }
   }, [obj.id, obj.y, raycaster, onDrag])
 
   useFrame(({ clock }) => {
     if (!meshRef.current) return
-    if (isSelected) {
-      meshRef.current.material.emissiveIntensity = 0.45 + Math.sin(clock.elapsedTime * 3) * 0.25
-    } else {
-      meshRef.current.material.emissiveIntensity = 0.15
-    }
+    meshRef.current.material.emissiveIntensity = isSelected
+      ? 0.45 + Math.sin(clock.elapsedTime * 3) * 0.25
+      : 0.15
   })
 
   return (
@@ -95,20 +106,19 @@ function AudioObjectSphere({ obj, isSelected, onSelect, onDrag }) {
         onPointerOver={() => { gl.domElement.style.cursor = 'grab' }}
         onPointerOut={() => { if (!dragging.current) gl.domElement.style.cursor = 'auto' }}
       >
-        <sphereGeometry args={[0.18, 20, 20]} />
+        <sphereGeometry args={[0.22, 20, 20]} />
         <meshStandardMaterial
           color="#FF6B00"
           emissive="#FF6B00"
           emissiveIntensity={0.15}
           transparent
-          opacity={isSelected ? 1.0 : 0.8}
+          opacity={isSelected ? 1.0 : 0.82}
         />
       </mesh>
 
-      {/* Glow ring when selected */}
       {isSelected && (
         <mesh rotation={[-Math.PI / 2, 0, 0]}>
-          <ringGeometry args={[0.22, 0.28, 32]} />
+          <ringGeometry args={[0.28, 0.36, 32]} />
           <meshBasicMaterial color="#FF6B00" transparent opacity={0.4} />
         </mesh>
       )}
@@ -122,7 +132,7 @@ function AudioObjectSphere({ obj, isSelected, onSelect, onDrag }) {
           background: isSelected ? 'rgba(0,0,0,0.7)' : 'none',
           padding: isSelected ? '1px 3px' : '0',
           borderRadius: '2px',
-          marginTop: '16px',
+          marginTop: '18px',
           textShadow: '0 0 6px #000',
         }}>
           {obj.name}
@@ -147,7 +157,92 @@ function ListenerMarker() {
   )
 }
 
-function Scene() {
+const SNAP_AZ  = Math.PI / 4
+const SNAP_POL = Math.PI / 6
+const _sph     = new THREE.Spherical()
+
+function CameraController({ actionsRef, orbitRef, snapping }) {
+  const { camera } = useThree()
+  const targetDistRef = useRef(null)
+  const snapTargetRef = useRef(null)
+  const snappingRef   = useRef(snapping)
+  useEffect(() => { snappingRef.current = snapping }, [snapping])
+
+  useEffect(() => {
+    const ctrl = orbitRef.current
+    if (!ctrl) return
+    const onEnd = () => {
+      if (!snappingRef.current) return
+      _sph.setFromVector3(camera.position.clone().sub(ctrl.target))
+      snapTargetRef.current = {
+        theta:  Math.round(_sph.theta / SNAP_AZ) * SNAP_AZ,
+        phi:    Math.max(0.08, Math.min(Math.PI - 0.08, Math.round(_sph.phi / SNAP_POL) * SNAP_POL)),
+        radius: _sph.radius,
+      }
+    }
+    ctrl.addEventListener('end', onEnd)
+    return () => ctrl.removeEventListener('end', onEnd)
+  }, [camera, orbitRef])
+
+  useFrame(() => {
+    const ctrl = orbitRef.current
+    if (!ctrl) return
+
+    // Smooth zoom
+    if (targetDistRef.current !== null) {
+      const dir  = camera.position.clone().sub(ctrl.target).normalize()
+      const cur  = camera.position.distanceTo(ctrl.target)
+      const next = THREE.MathUtils.lerp(cur, targetDistRef.current, 0.1)
+      camera.position.copy(ctrl.target).addScaledVector(dir, next)
+      ctrl.update()
+      if (Math.abs(next - targetDistRef.current) < 0.005) {
+        camera.position.copy(ctrl.target).addScaledVector(dir, targetDistRef.current)
+        ctrl.update()
+        targetDistRef.current = null
+      }
+    }
+
+    // Smooth snap rotation
+    if (snapTargetRef.current) {
+      _sph.setFromVector3(camera.position.clone().sub(ctrl.target))
+      _sph.theta  = THREE.MathUtils.lerp(_sph.theta, snapTargetRef.current.theta,  0.12)
+      _sph.phi    = THREE.MathUtils.lerp(_sph.phi,   snapTargetRef.current.phi,    0.12)
+      _sph.radius = snapTargetRef.current.radius
+      camera.position.setFromSpherical(_sph).add(ctrl.target)
+      ctrl.update()
+      if (
+        Math.abs(_sph.theta - snapTargetRef.current.theta) < 0.002 &&
+        Math.abs(_sph.phi   - snapTargetRef.current.phi)   < 0.002
+      ) {
+        _sph.theta = snapTargetRef.current.theta
+        _sph.phi   = snapTargetRef.current.phi
+        camera.position.setFromSpherical(_sph).add(ctrl.target)
+        ctrl.update()
+        snapTargetRef.current = null
+      }
+    }
+  })
+
+  useEffect(() => {
+    actionsRef.current = {
+      zoomIn: () => {
+        const ctrl = orbitRef.current
+        if (!ctrl) return
+        const cur = targetDistRef.current ?? camera.position.distanceTo(ctrl.target)
+        targetDistRef.current = Math.max(ctrl.minDistance ?? 3, cur * 0.6)
+      },
+      zoomOut: () => {
+        const ctrl = orbitRef.current
+        if (!ctrl) return
+        const cur = targetDistRef.current ?? camera.position.distanceTo(ctrl.target)
+        targetDistRef.current = Math.min(ctrl.maxDistance ?? 28, cur * 1.65)
+      },
+    }
+  })
+  return null
+}
+
+function Scene({ locked, lockedRef, snapping, orbitRef, cameraActionsRef }) {
   const { objects, updateObject, selectedObjectId, setSelectedObjectId, speakerPreset, SPEAKER_POSITIONS } = useAudio()
   const speakers = SPEAKER_POSITIONS[speakerPreset] ?? []
 
@@ -190,6 +285,8 @@ function Scene() {
           isSelected={obj.id === selectedObjectId}
           onSelect={setSelectedObjectId}
           onDrag={handleDrag}
+          orbitRef={orbitRef}
+          lockedRef={lockedRef}
         />
       ))}
 
@@ -198,9 +295,13 @@ function Scene() {
         <meshBasicMaterial />
       </mesh>
 
+      <CameraController actionsRef={cameraActionsRef} orbitRef={orbitRef} snapping={snapping} />
+
       <OrbitControls
+        ref={orbitRef}
         makeDefault
-        enablePan
+        enabled={!locked}
+        enablePan={!locked}
         minDistance={3}
         maxDistance={28}
         target={[0, 0, 0]}
@@ -211,53 +312,143 @@ function Scene() {
 
 export default function RoomView() {
   const { objects } = useAudio()
+  const [locked,       setLocked]       = useState(false)
+  const [snapping,     setSnapping]     = useState(false)
+  const [sideExpanded, setSideExpanded] = useState(false)
+  const orbitRef       = useRef(null)
+  const lockedRef      = useRef(false)
+  const cameraActionsRef = useRef({ zoomIn: () => {}, zoomOut: () => {} })
+
+  // Keep lockedRef in sync so sphere callbacks can read it without stale closure
+  useEffect(() => { lockedRef.current = locked }, [locked])
+
+  // L key toggles lock
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
+      if (e.key === 'l' || e.key === 'L') setLocked(p => !p)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
+  const iconBtn = 'w-7 h-7 flex items-center justify-center rounded border transition-all cursor-pointer'
 
   return (
-    <div className="relative w-full h-full" style={{ background: '#080808' }}>
-      <Canvas
-        camera={{ position: [0, 8, 11], fov: 48 }}
-        gl={{ antialias: true, alpha: false, preserveDrawingBuffer: false }}
-        style={{ background: '#080808' }}
+    <div className="relative w-full h-full overflow-hidden" style={{ background: '#080808' }}>
+
+      {/* OrthoView — collapsed: bottom-left widget matching minimap; expanded: left overlay panel */}
+      <div
+        className="absolute z-20"
+        style={sideExpanded
+          ? { top: 0, left: 0, bottom: 0, width: 'clamp(280px, 48%, 580px)', transition: 'width 0.22s ease' }
+          : { bottom: 16, left: 16 }
+        }
       >
-        <Suspense fallback={null}>
-          <Scene />
-        </Suspense>
-      </Canvas>
-
-      {/* Minimap */}
-      <div className="absolute bottom-4 right-4 z-10">
-        <RoomMinimap />
+        <OrthoView expanded={sideExpanded} onExpandToggle={() => setSideExpanded(p => !p)} />
       </div>
 
-      {/* Legend */}
-      <div className="absolute top-3 left-3 z-10 flex flex-col gap-1.5">
-        {[
-          { color: '#FF6B00', label: 'Audio Objects' },
-          { color: '#555555', label: 'Speakers'       },
-          { color: '#ffffff', label: 'Listener'       },
-        ].map(({ color, label }) => (
-          <div key={label} className="flex items-center gap-2 text-xs text-[#737373]">
-            <div className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: color }} />
-            {label}
-          </div>
-        ))}
-      </div>
+      {/* 3D view (always fills full area, OrthoView overlays it) */}
+      <div className="absolute inset-0" style={{ background: '#080808' }}>
+        <Canvas
+          camera={{ position: [0, 8, 11], fov: 48 }}
+          gl={{ antialias: true, alpha: false, preserveDrawingBuffer: false }}
+          style={{ background: '#080808', width: '100%', height: '100%' }}
+        >
+          <Suspense fallback={null}>
+            <Scene
+              locked={locked}
+              lockedRef={lockedRef}
+              snapping={snapping}
+              orbitRef={orbitRef}
+              cameraActionsRef={cameraActionsRef}
+            />
+          </Suspense>
+        </Canvas>
 
-      {/* Empty state hint */}
-      {objects.length === 0 && (
-        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-          <div className="text-center">
-            <div className="text-[#2a2a2a] text-4xl mb-2">⬡</div>
-            <div className="text-xs text-[#333333]">Import audio files to add objects to the scene</div>
-          </div>
+        {/* Minimap */}
+        <div className="absolute bottom-4 right-4 z-10">
+          <RoomMinimap />
         </div>
-      )}
 
-      {/* Controls hint */}
-      <div className="absolute top-3 right-3 z-10 text-right text-[10px] text-[#333333] leading-relaxed">
-        <div>Drag sphere to move</div>
-        <div>Scroll to zoom</div>
-        <div>Right-drag to orbit</div>
+        {/* Legend */}
+        <div className="absolute top-3 left-3 z-10 flex flex-col gap-1.5">
+          {[
+            { color: '#FF6B00', label: 'Audio Objects' },
+            { color: '#555555', label: 'Speakers'      },
+            { color: '#ffffff', label: 'Listener'      },
+          ].map(({ color, label }) => (
+            <div key={label} className="flex items-center gap-2 text-xs text-[#737373]">
+              <div className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: color }} />
+              {label}
+            </div>
+          ))}
+        </div>
+
+        {/* Top-right: lock + snap + zoom */}
+        <div className="absolute top-3 right-3 z-10 flex flex-col items-end gap-2">
+          <button
+            onClick={() => setLocked(p => !p)}
+            className={`${iconBtn} ${locked
+              ? 'border-[#FF6B00] bg-[#FF6B00]/10 text-[#FF6B00]'
+              : 'border-[#333333] bg-[#1a1a1a]/80 text-[#737373] hover:text-white hover:border-[#474747]'
+            }`}
+            title={locked ? 'Unlock viewport (L)' : 'Lock viewport (L)'}
+          >
+            {locked ? <Lock size={12} /> : <LockOpen size={12} />}
+          </button>
+
+          <button
+            onClick={() => setSnapping(p => !p)}
+            className={`${iconBtn} ${snapping
+              ? 'border-[#FF6B00] bg-[#FF6B00]/10 text-[#FF6B00]'
+              : 'border-[#333333] bg-[#1a1a1a]/80 text-[#737373] hover:text-white hover:border-[#474747]'
+            }`}
+            title={snapping ? 'Snap rotation ON' : 'Enable rotation snapping'}
+          >
+            <Magnet size={12} />
+          </button>
+
+          <div className="flex flex-col gap-1">
+            <button
+              onClick={() => cameraActionsRef.current.zoomIn()}
+              className={`${iconBtn} border-[#333333] bg-[#1a1a1a]/80 text-[#737373] hover:text-white hover:border-[#474747]`}
+              title="Zoom In"
+            >
+              <ZoomIn size={12} />
+            </button>
+            <button
+              onClick={() => cameraActionsRef.current.zoomOut()}
+              className={`${iconBtn} border-[#333333] bg-[#1a1a1a]/80 text-[#737373] hover:text-white hover:border-[#474747]`}
+              title="Zoom Out"
+            >
+              <ZoomOut size={12} />
+            </button>
+          </div>
+
+          {!locked && !snapping && (
+            <div className="text-right text-[10px] text-[#333333] leading-relaxed mt-1">
+              <div>Drag sphere to move</div>
+              <div>Scroll to zoom</div>
+              <div>Right-drag to orbit</div>
+            </div>
+          )}
+          {locked && (
+            <div className="text-right text-[10px] mt-1" style={{ color: '#FF6B00', opacity: 0.55 }}>
+              View locked
+            </div>
+          )}
+        </div>
+
+        {/* Empty state */}
+        {objects.length === 0 && (
+          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <div className="text-center">
+              <div className="text-[#2a2a2a] text-4xl mb-2">⬡</div>
+              <div className="text-xs text-[#333333]">Import audio files to add objects to the scene</div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )
