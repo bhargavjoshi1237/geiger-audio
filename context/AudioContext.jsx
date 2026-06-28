@@ -63,6 +63,8 @@ export function AudioProvider({ children }) {
   const webAudioCtxRef = useRef(null)
   const masterGainRef = useRef(null)
   const analyserRef = useRef(null)
+  // Shared playback controls — TransportBar writes these, SeekBar reads them
+  const playbackControlsRef = useRef({ getPosition: () => 0, seekTo: () => {}, getDuration: () => 0 })
 
   const [objects, setObjects] = useState([])
   const [selectedObjectId, setSelectedObjectId] = useState(null)
@@ -70,8 +72,8 @@ export function AudioProvider({ children }) {
   const [speakerPreset, setSpeakerPreset] = useState('7.1.4')
   const [transport, setTransport] = useState({
     isPlaying: false,
+    isPaused: false,
     isRecording: false,
-    timecode: '00:00:00:00',
     bpm: 120,
     masterGain: 0.8,
     latency: 0,
