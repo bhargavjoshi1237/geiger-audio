@@ -2,7 +2,7 @@ import './globals.css'
 import { AudioProvider } from '@/context/AudioContext'
 
 export const metadata = {
-  title: 'Dolby Atmos Renderer — Geiger Audio',
+  title: 'Renderer — Geiger Audio',
   description: 'Professional spatial audio renderer',
 }
 
